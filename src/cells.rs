@@ -175,6 +175,25 @@ impl MlstmCell {
         self.normalize(self.project(query, key, value).parallel(self.epsilon))
     }
 
+    /// Processes matrix memory in parallel chunks and returns continuation state.
+    ///
+    /// # Panics
+    /// Panics for invalid shapes, state, or a zero chunk size.
+    #[must_use]
+    pub fn chunked(
+        &self,
+        query: Tensor<3>,
+        key: Tensor<3>,
+        value: Tensor<3>,
+        state: Option<MlstmState>,
+        chunk_size: usize,
+    ) -> (Tensor<3>, MlstmState) {
+        let (hidden, state) =
+            self.project(query, key, value)
+                .chunked(state, chunk_size, self.epsilon);
+        (self.normalize(hidden), state)
+    }
+
     /// Retrieves normalized memory for one token and returns the new state.
     ///
     /// # Panics

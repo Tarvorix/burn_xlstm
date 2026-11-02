@@ -126,7 +126,7 @@ fn matrix_outputs_and_all_input_derivatives_match_independent_equations() {
         let values = inputs(3 * TIME * DIM + 2 * TIME, phase);
         let expected = matrix_equations(&values.iter().copied().map(f64::from).collect::<Vec<_>>());
         let numerical = differences(&values, matrix_equations);
-        for parallel in [false, true] {
+        for mode in 0..3 {
             let all =
                 Tensor::<1>::from_data(TensorData::new(values.clone(), [values.len()]), &device)
                     .require_grad();
@@ -148,8 +148,10 @@ fn matrix_outputs_and_all_input_derivatives_match_independent_equations() {
                 input: gate(3 * span),
                 forget: gate(3 * span + TIME),
             };
-            let output = if parallel {
+            let output = if mode == 1 {
                 data.parallel(1e-12)
+            } else if mode == 2 {
+                data.chunked(None, 2, 1e-12).0
             } else {
                 let mut state = MlstmState::zeros([1, 1, DIM], &device);
                 let mut outputs = Vec::new();

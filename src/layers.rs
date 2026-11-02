@@ -195,6 +195,8 @@ impl SlstmLayer {
 pub struct MlstmConfig {
     /// Input and output feature width.
     pub embedding_dim: usize,
+    /// Optional parallel chunk length; `None` keeps full parallel/recurrent execution.
+    pub chunk_size: Option<usize>,
     /// Expanded width; defaults to twice the input width rounded up to 64.
     pub inner_dim: Option<usize>,
     /// Number of matrix memory heads.
@@ -224,6 +226,9 @@ impl MlstmConfig {
     /// Returns an error for invalid dimensions, group division, dropout, or epsilon.
     pub fn init(&self, device: &Device) -> Result<MlstmLayer, ConfigError> {
         config::dimensions(self.embedding_dim, 1)?;
+        if self.chunk_size == Some(0) {
+            return Err(ConfigError::new("chunk_size", "must be positive"));
+        }
         let width = self
             .inner_dim
             .unwrap_or_else(|| config::rounded(self.embedding_dim, 2, 1));
@@ -245,6 +250,7 @@ impl MlstmConfig {
         }
         let projection_heads = width / self.qkv_block_size;
         Ok(MlstmLayer {
+            chunk_size: self.chunk_size,
             up: linear(
                 self.embedding_dim,
                 2 * width,
@@ -286,6 +292,8 @@ impl MlstmConfig {
 /// Expanded mLSTM layer with an output gate and learned local skip.
 #[derive(Module, Debug)]
 pub struct MlstmLayer {
+    /// Optional parallel chunk length, used by sequence and stateful execution.
+    pub chunk_size: Option<usize>,
     /// Joint memory/output-gate expansion.
     pub up: Linear,
     /// Projection back to model width.
@@ -358,6 +366,9 @@ impl MlstmLayer {
     /// Panics for empty dimensions or incompatible feature widths.
     #[must_use]
     pub fn forward(&self, input: Tensor<3>) -> Tensor<3> {
+        if self.chunk_size.is_some() {
+            return self.forward_with_state(input, None).0;
+        }
         let (memory, convolved, gate, _) = self.prepare(input, None);
         let hidden = self.cell.forward(
             self.query.forward(convolved.clone()),
@@ -367,10 +378,13 @@ impl MlstmLayer {
         self.finish(hidden, convolved, gate)
     }
 
-    /// Processes a chunk recurrently, returning state for the next chunk.
+    /// Processes a sequence and returns state for continuation.
     ///
-    /// Uses memory linear in sequence length during training and constant
-    /// recurrent state during inference; it does not build a time-by-time matrix.
+    /// Uses parallel chunks when `chunk_size` is set, otherwise recurrent steps.
+    ///
+    /// Recurrent steps form no time-by-time interaction matrix and retain constant
+    /// recurrent state during inference. Parallel chunks use O(time × `chunk_size`)
+    /// interaction storage during training, plus states and other activations.
     ///
     /// # Panics
     /// Panics for empty dimensions or incompatible input/state shapes.
@@ -400,6 +414,13 @@ impl MlstmLayer {
         let query = self.query.forward(convolved.clone());
         let key = self.key.forward(convolved.clone());
         let value = self.value.forward(memory);
+        if let Some(chunk_size) = self.chunk_size.filter(|_| time > 1) {
+            let (hidden, cell) = self.cell.chunked(query, key, value, Some(cell), chunk_size);
+            return (
+                self.finish(hidden, convolved, gate),
+                MlstmLayerState { cell, conv },
+            );
+        }
         let mut outputs = Vec::with_capacity(time);
         for token in 0..time {
             let take = |x: &Tensor<3>| x.clone().slice([0..batch, token..token + 1, 0..width]);

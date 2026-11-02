@@ -76,7 +76,9 @@ fn long_matrix_sequences_and_gradients_agree_between_execution_paths() {
     let device = Device::flex();
     for time in [127, 512, 2048] {
         let data = input(time, &device);
-        close(data.clone().parallel(1e-6), recurrent(&data), 2e-4);
+        let expected = recurrent(&data);
+        close(data.clone().parallel(1e-6), expected.clone(), 2e-4);
+        close(data.chunked(None, 64, 1e-6).0, expected, 2e-4);
     }
     let device = device.autodiff();
     let mut data = input(257, &device);
@@ -89,6 +91,9 @@ fn long_matrix_sequences_and_gradients_agree_between_execution_paths() {
     let parallel = (data.clone().parallel(1e-6) * weights.clone())
         .sum()
         .backward();
+    let chunked = (data.clone().chunked(None, 64, 1e-6).0 * weights.clone())
+        .sum()
+        .backward();
     let recurrent = (recurrent(&data) * weights).sum().backward();
     for tensor in [
         &data.query,
@@ -99,6 +104,11 @@ fn long_matrix_sequences_and_gradients_agree_between_execution_paths() {
     ] {
         close(
             tensor.grad(&parallel).unwrap(),
+            tensor.grad(&recurrent).unwrap(),
+            2e-4,
+        );
+        close(
+            tensor.grad(&chunked).unwrap(),
             tensor.grad(&recurrent).unwrap(),
             2e-4,
         );

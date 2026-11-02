@@ -86,3 +86,7 @@ multiple_crate_versions = "allow"
 [[example]]
 name = "delayed_copy"
 required-features = ["flex"]
+
+[[example]]
+name = "benchmark"
+required-features = ["flex"]

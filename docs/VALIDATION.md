@@ -1,8 +1,9 @@
 # Validation record
 
 Validated locally on 2026-11-02 with Burn 0.22.1, macOS CPU/Flex and WGPU
-float32. The default suite passes **24 integration tests and 2 doctests**. The
-separate GPU test passes the original stack and the complete shape sweep.
+float32. The default suite passes **31 integration tests and 3 doctests**. The
+three separate GPU tests cover padded/packed batches, raw chunkwise recurrence,
+and the original stack plus the complete shape sweep.
 This is strong evidence for the tested implementation and configurations; finite
 tests cannot prove universal correctness or convergence on arbitrary tasks.
 
@@ -22,7 +23,8 @@ Normal Cargo tests consume the checked-in JSON and require no Python.
   scalar-only, matrix-only, and mixed stacks; depths 1–3; batches 1–3; widths
   4, 6, 8, 12, 16; heads 1–4; sequence lengths 1–31; projection group widths
   1, 2, 3, 4, 6, 8; convolution widths 0, 2, 3, 4, 7.
-- Every sweep case compares full-sequence and chunked outputs, input gradients,
+- Every sweep case runs with the original execution path and parallel chunks of
+  three tokens, comparing full-sequence and continued outputs, input gradients,
   and **every learned parameter gradient**, on both CPU and GPU. The sweep
   contains 26,398 parameter coordinates across 305 reference tensors.
   All parameters are randomized, including the normally zero recurrent/gate
@@ -30,7 +32,8 @@ Normal Cargo tests consume the checked-in JSON and require no Python.
 
 The normalized error is `abs(actual - expected) / (1 + abs(expected))`.
 Tolerances are `2e-6` for raw outputs/states, `2e-5` for raw gradients, `1e-5`
-for stack outputs, and `8e-5` for stack input/parameter gradients. No tolerance
+for stack outputs, and `8e-5` for stack input/parameter gradients. The added
+chunkwise raw-kernel checks use `3e-6` for outputs/states and `3e-5` for gradients. No tolerance
 was increased to make the shape sweep pass.
 
 The pinned reference has convolution edge bugs for mLSTM kernel zero and kernel
@@ -41,7 +44,7 @@ than treating broken reference outputs as expected behavior.
 
 [`tests/numerics.rs`](../tests/numerics.rs) implements direct, unstabilized paper
 equations using Rust f64 scalars and arrays. Moderate inputs avoid overflow.
-Three deterministic input sets compare outputs and **612 derivative coordinates**
+Three deterministic input sets compare outputs and **810 derivative coordinates**
 against central differences with step `1e-5`. These oracles use neither Burn
 operations nor PyTorch autodiff. For this independent mLSTM comparison, the
 Burn epsilon is `1e-12`, making it negligible against the paper's unit floor;
@@ -49,7 +52,7 @@ reference parity separately tests the production `1e-6` epsilon.
 
 Additional checks cover:
 
-- Matrix parallel/recurrent agreement at lengths 127, 512, and **2,048**, and
+- Matrix parallel/chunkwise/recurrent agreement at lengths 127, 512, and **2,048**, and
   gradient agreement at length 257. Float32 cumulative-sum rounding is covered
   by a declared `2e-4` normalized tolerance for these long tests.
 - A 257-token mixed stack with irregular chunks, prefill and continuation;
@@ -61,6 +64,29 @@ Additional checks cover:
 - Checkpoint round trips, state detachment, configuration validation, invalid
   state counts, one-coordinate scalar heads, and language-model streaming.
 
+## Padding, packed batches, and parallel chunks
+
+The batch regression compares padding against processing each sequence alone,
+including input gradients and continuation after padding. Scalar recurrent
+weights are nonzero so hidden-state masking affects later tokens. It covers zero-length
+lanes, internal mask holes, ignored resets on invalid positions, and NaNs in
+padded inputs. Separate tests compare packed and padded next-token loss and
+parameter gradients, verify gradient isolation across sequence resets, and check
+finite zero loss/gradients when every token is padding. Invalid padded token IDs
+and targets are sanitized before lookup; valid IDs remain subject to bounds checks.
+
+Raw chunkwise kernels are compared to the committed NX-AI recurrent fixtures at
+chunk sizes 1, 2, 3, 5, and 16, including chunks longer than the sequence and short
+final chunks. A nonzero initial-state test compares final state and derivatives
+with respect to incoming memory, normalizer, and log scale against token steps.
+The long-sequence and independent f64 finite-difference tests include chunkwise
+execution. Padded/packed and raw chunkwise checks also pass on WGPU float32.
+
+Masked execution intentionally uses token steps, preserving arbitrary holes and
+boundaries without host synchronization. Uniform-length batches can use the
+parallel chunkwise path. The two APIs have different performance characteristics;
+packing is not claimed to automatically accelerate this portable implementation.
+
 ## Learning on unseen sequences
 
 [`tests/learning.rs`](../tests/learning.rs) trains delayed-token copy using fresh
@@ -70,7 +96,7 @@ token requires recurrent memory.
 
 Settings: width 16, two heads, mLSTM inner width 32, feedforward width 24,
 model initialization seed 1729, Adam learning rate 0.003, 400 updates, batch 16,
-training length 12, vocabulary size four. The matrix-only model has two mLSTM
+training length 12, vocabulary size four, parallel mLSTM chunk length four. The matrix-only model has two mLSTM
 blocks; the scalar-only model has one sLSTM; the mixed model has mLSTM then sLSTM.
 
 Two final evaluation seeds, `a66d8c513390ef27` and `509bf17cd3a82261`, were reserved
@@ -82,7 +108,7 @@ Length 24 also tests continuation beyond the training length.
 | Model | Initial loss, first holdout | Final loss range across four evaluations | Accuracy in each evaluation |
 | --- | ---: | ---: | ---: |
 | sLSTM | 1.786598 | 0.001484–0.001499 | 100% |
-| mLSTM–mLSTM | 1.651991 | 0.001205–0.001313 | 100% |
+| mLSTM–mLSTM | 1.651991 | 0.001101–0.001143 | 100% |
 | mLSTM–sLSTM | 1.524220 | 0.000998–0.001079 | 100% |
 
 The automated threshold is accuracy above 95% and loss below 15% of the initial
@@ -100,7 +126,7 @@ cargo fmt --all --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked
 cargo test --locked --test learning -- --nocapture
-cargo test --locked --features wgpu --test parity wgpu_stack -- --ignored --nocapture
+cargo test --locked --features wgpu --test batching --test chunked --test parity -- --ignored --nocapture
 RUSTDOCFLAGS='-D warnings' cargo doc --locked --no-deps
 cargo check --locked --no-default-features
 cargo check --locked --no-default-features --features wgpu
@@ -125,7 +151,10 @@ git diff --exit-code -- tests/fixtures
 ## Remaining scope
 
 Windows, other GPU vendors/backends, mixed precision, large-model training,
-throughput, and distributed execution have not been validated. These tests do
+end-to-end throughput, and distributed execution have not been validated.
+Local kernel-level timings are recorded in [BENCHMARKS.md](BENCHMARKS.md). These tests do
 not validate NX-AI's optimized CUDA/Triton kernels or xLSTM-large, which this
-crate does not implement. Long parallel mLSTM still uses quadratic storage;
-stateful execution provides bounded recurrent state for inference.
+crate does not implement. The optional full parallel path uses quadratic storage; parallel chunkwise
+execution reduces interaction storage, and stateful inference retains bounded
+recurrent memory. Mixed precision and custom CUDA/Triton kernels remain outside
+this validation.

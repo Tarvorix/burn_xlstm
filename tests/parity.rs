@@ -407,8 +407,19 @@ fn shape_sweep(device: &Device) {
             .with_feedforward_dim(Some(3 * number("width") / 2))
             .with_qkv_block_size(number("group"))
             .with_conv_kernel(number("kernel"));
-        for chunked in [false, true] {
-            check_stack(config.init(device).unwrap(), case, device, chunked);
+        for size in [None, Some(3)] {
+            for chunked in [false, true] {
+                check_stack(
+                    config
+                        .clone()
+                        .with_mlstm_chunk_size(size)
+                        .init(device)
+                        .unwrap(),
+                    case,
+                    device,
+                    chunked,
+                );
+            }
         }
     }
 }

@@ -49,8 +49,10 @@ let state = state.detach(); // optional: truncated backpropagation boundary
 # }
 ```
 
-`forward` starts a fresh sequence and uses a causal parallel mLSTM kernel.
-`forward_with_state` accepts arbitrary nonempty chunks and uses recurrent mLSTM.
+`forward` starts a fresh sequence. By default it uses full parallel mLSTM;
+`.with_mlstm_chunk_size(Some(64))` selects parallel chunks of at most 64 tokens.
+`forward_with_state` accepts arbitrary nonempty chunks and returns continuation
+memory, using the configured chunkwise path or recurrent steps.
 `step` requires time length one. Pass `None` to reset a sequence. State must match
 the model, batch, device, and dtype; it retains its backward graph until detached.
 
@@ -59,6 +61,69 @@ inference model with dropout disabled; `Module::train()` enables training again.
 Sequence/stream comparisons require dropout to be disabled. Full and recurrent
 mLSTM can differ slightly because their log stabilizers and epsilon scales differ.
 
+## Variable-length batches
+
+`LmBatch::padded` creates aligned next-token inputs and targets from independent
+sequences. `LmBatch::packed` combines several sequences into a fixed-width row;
+it resets memory and convolution at each boundary and never creates a target
+that crosses from one original sequence into another.
+
+```rust
+use burn::tensor::Device;
+use burn_xlstm::{batch::LmBatch, lm::XlstmLmConfig, stack::{BlockKind, XlstmConfig}};
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+let device = Device::flex().autodiff();
+let config = XlstmConfig::new(16, vec![BlockKind::Mlstm, BlockKind::Slstm])
+    .with_num_heads(2).with_mlstm_chunk_size(Some(64));
+let model = XlstmLmConfig::new(32, config).init(&device)?;
+let sequences = vec![vec![1, 2, 3, 4], vec![5, 6, 7]];
+let batch = LmBatch::padded(&sequences, &device)?;
+// Alternatively: LmBatch::packed(&sequences, 8, &device)?;
+let (logits, state) = model.forward_masked(batch.inputs.clone(), &batch.mask, None);
+let loss = batch.loss(logits);
+let gradients = loss.backward();
+# let _ = (state, gradients);
+# Ok(())
+# }
+```
+
+For continuous features or custom targets, use `SequenceMask`,
+`Xlstm::forward_masked`, and `batch::masked_cross_entropy`. `valid = true` means
+consume the token; false positions output zeros and preserve **all** recurrent
+and convolution state. `reset = true` clears a lane before its valid token;
+reset flags at invalid positions are ignored. An entirely masked loss is finite
+zero. Masked token IDs and targets are sanitized before embedding/loss evaluation.
+
+The masked path runs recurrently to support arbitrary mask holes and packed
+boundaries. For uniform-length batches, use ordinary `forward` with parallel
+chunks for higher throughput. Dropout must be disabled for numerical comparisons
+between packed, padded, and separate-sequence processing.
+
+## Parallel chunkwise execution
+
+Set `.with_mlstm_chunk_size(Some(64))` on `XlstmConfig`, or `.with_chunk_size(Some(64))`
+on `MlstmConfig`. Matrix products evaluate tokens within each chunk in parallel;
+recurrent matrix memory connects chunks, including their gradients. The last
+chunk can be shorter. Existing state can be supplied to `forward_with_state`.
+
+This reduces the interaction intermediates from O(time²) to O(time × `chunk_size`)
+during training. It also retains chunk-boundary matrix states and ordinary model
+activations; this is not a claim of constant total training memory. The default
+`None` retains the original full parallel path for reference comparisons.
+
+Run synchronized CPU/GPU kernel benchmarks with:
+
+```sh
+cargo run --release --example benchmark
+cargo run --release --features wgpu --example benchmark -- --wgpu
+```
+
+These measure forward and forward/backward execution at lengths 128, 512, and
+2,048, with a warmup and the median of three samples. Timings include scalar
+readback to ensure GPU work executes. They compare full parallel, chunkwise,
+and token-recurrent mLSTM. See the [benchmark record](https://github.com/Tarvorix/burn_xlstm/blob/main/docs/BENCHMARKS.md)
+for measurements; these are not end-to-end language-model timings.
+
 ## Implemented structure
 
 | Component | Behavior |
@@ -66,7 +131,7 @@ mLSTM can differ slightly because their log stabilizers and epsilon scales diffe
 | sLSTM | Exponential input gate, sigmoid forget gate, stabilized scalar memory/normalizer, sigmoid output gate, headwise recurrent memory mixing |
 | sLSTM layer | Causal depthwise convolution + `SiLU` for input/forget projections; unconvolved candidate/output projections; dropout then head normalization |
 | sLSTM block | Pre-LayerNorm memory residual, followed by a separate pre-LayerNorm GELU-gated feedforward residual |
-| mLSTM | Stabilized key/value covariance update, scaled keys, absolute normalizer with floor; recurrent and causal parallel execution |
+| mLSTM | Stabilized key/value covariance update, scaled keys, absolute normalizer with floor; recurrent, causal parallel, and parallel chunkwise execution |
 | mLSTM layer | Expanded memory/output branches; convolution; grouped q/k/v projections; head normalization; learned local skip; `SiLU` output gate; down-projection |
 | Stack | Explicit mixed block order and optional final `LayerNorm` |
 | Language model | Token embeddings, mixed stack, untied bias-free vocabulary logits |
@@ -153,7 +218,7 @@ requires a GPU and is opt-in:
 cargo test --features wgpu --test parity wgpu_stack -- --ignored
 ```
 
-The default suite passes 24 integration tests and 2 doctests. Scalar-only,
+The default suite passes 31 integration tests and 3 doctests. Scalar-only,
 matrix-only, and mixed models reached 100% accuracy on the held-out delayed-copy
 test, including sequences twice the training length. This is evidence for the
 tested configurations, not a guarantee of universal correctness. See the
@@ -185,16 +250,17 @@ optional features, and compatibility with other model variants.
 | Feature | Current support and when it matters |
 | --- | --- |
 | Specialized CUDA/Triton kernels | Computation uses portable Burn tensor operations, including GPU execution through WGPU. NX-AI's specialized kernels are not ported; their absence affects performance, not the defining equations. |
-| Parallel chunkwise mLSTM | Full-sequence mLSTM is parallel with O(time²) intermediate storage. The stateful API accepts chunks but processes them recurrently. A parallel chunkwise kernel would improve the execution options for long-context training. |
+| Parallel chunkwise mLSTM | Available through `mlstm_chunk_size`; parallel work inside chunks carries differentiable memory between chunks. The full parallel and token-recurrent paths remain available. |
 | xLSTM-large / pretrained 7B | NX-AI's later updated architecture and pretrained weights are not implemented. They are separate from the original architecture supported here. |
-| Packed/ragged sequences | Batches use rectangular tensors. Efficiently combining unequal-length sequences without padding needs additional support and sequence-boundary handling. |
-| Padding masks | There is no built-in padding mask. Use equal-length batches or handle padding-aware loss and recurrent state explicitly; padding is otherwise processed as input. |
+| Packed/ragged sequences | `LmBatch::padded` and `LmBatch::packed` batch variable-length token sequences. Storage remains rectangular; explicit masks and resets preserve independent sequences. |
+| Padding masks | `forward_masked` skips memory/convolution updates and zeros invalid outputs. `masked_cross_entropy` ignores invalid targets. |
 | Weight tying | Token embeddings and vocabulary output weights are independent. Sharing them is an optional parameter-saving feature. |
-| General PyTorch checkpoint import | Burn checkpoints are supported. Loading arbitrary NX-AI checkpoints would require a converter and matching architecture/configuration; the test fixture loader is not a general importer. |
+| General `PyTorch` checkpoint import | Burn checkpoints are supported. Loading arbitrary NX-AI checkpoints would require a converter and matching architecture/configuration; the test fixture loader is not a general importer. |
 
 Bias-free projections and GELU feedforwards match the selected reference
-configuration. Float32 CPU and WGPU numerical parity are tested; GPU throughput
-and mixed-precision training have not been benchmarked or certified. Stateful
+configuration. Float32 CPU and WGPU numerical parity are tested. Mixed-precision
+training has not been validated. Kernel benchmarks are provided; end-to-end
+large-model throughput has not been certified. Stateful
 inference retains bounded recurrent memory; sLSTM necessarily runs recurrently.
 
 NX-AI documents its [updated xLSTM Large architecture](https://github.com/NX-AI/xlstm#xlstm-7b-a-recurrent-llm-for-fast-and-efficient-inference)

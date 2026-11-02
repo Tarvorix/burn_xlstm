@@ -151,6 +151,105 @@ pub struct MlstmInput {
 }
 
 impl MlstmInput {
+    /// Processes parallel chunks with recurrent memory between chunks.
+    ///
+    /// Each chunk forms a causal `chunk_size × chunk_size` interaction matrix,
+    /// combines it with incoming memory, and updates memory with matrix products.
+    /// Training retains O(time × `chunk_size`) attention intermediates instead of
+    /// O(time²); state gradients remain connected across chunk boundaries.
+    /// The stabilizer includes incoming state, matching recurrent execution.
+    ///
+    /// # Panics
+    /// Panics for zero chunk size, invalid epsilon, or incompatible shapes.
+    #[must_use]
+    pub fn chunked(
+        self,
+        state: Option<MlstmState>,
+        chunk_size: usize,
+        epsilon: f64,
+    ) -> (Tensor<4>, MlstmState) {
+        let [batch, heads, time, dim] = self.check(epsilon);
+        assert!(chunk_size > 0, "mLSTM chunk size must be positive");
+        let mut state =
+            state.unwrap_or_else(|| MlstmState::zeros([batch, heads, dim], &self.query.device()));
+        assert_eq!(
+            state.memory.dims(),
+            [batch, heads, dim, dim],
+            "mLSTM memory shape mismatch"
+        );
+        assert_eq!(
+            state.normalizer.dims(),
+            [batch, heads, dim, 1],
+            "mLSTM normalizer shape mismatch"
+        );
+        assert_eq!(
+            state.log_scale.dims(),
+            [batch, heads, 1, 1],
+            "mLSTM scale shape mismatch"
+        );
+        let mut outputs = Vec::with_capacity(time.div_ceil(chunk_size));
+        for start in (0..time).step_by(chunk_size) {
+            let end = start.saturating_add(chunk_size).min(time);
+            let take = |x: &Tensor<4>| x.clone().slice([0..batch, 0..heads, start..end]);
+            let chunk = Self {
+                query: take(&self.query),
+                key: take(&self.key),
+                value: take(&self.value),
+                input: take(&self.input),
+                forget: take(&self.forget),
+            };
+            let (output, next) = chunk.chunk(state, epsilon);
+            outputs.push(output);
+            state = next;
+        }
+        (Tensor::cat(outputs, 2), state)
+    }
+
+    fn chunk(self, state: MlstmState, epsilon: f64) -> (Tensor<4>, MlstmState) {
+        let [batch, heads, time, dim] = self.query.dims();
+        let indices = Tensor::<1, Int>::arange(
+            0..i64::try_from(time).expect("sequence length exceeds i64"),
+            &self.query.device(),
+        );
+        let future = indices
+            .clone()
+            .reshape([1, time])
+            .greater(indices.reshape([time, 1]))
+            .reshape([1, 1, time, time]);
+        let accumulated = activation::log_sigmoid(self.forget).cumsum(2);
+        let decay = (accumulated.clone() - accumulated.clone().swap_dims(2, 3)
+            + self.input.swap_dims(2, 3))
+        .mask_fill(future, f64::NEG_INFINITY);
+        let incoming = accumulated + state.log_scale;
+        let scale = decay.clone().max_dim(3).max_pair(incoming.clone());
+        let weights = (decay - scale.clone()).exp();
+        let carry = (incoming - scale.clone()).exp();
+        let key = self.key / crate::components::size_f64(dim).sqrt();
+        let combination = self.query.clone().matmul(key.clone().swap_dims(2, 3)) * weights.clone();
+        let numerator = self.query.clone().matmul(state.memory.clone()) * carry.clone()
+            + combination.clone().matmul(self.value.clone());
+        let dot =
+            self.query.matmul(state.normalizer.clone()) * carry.clone() + combination.sum_dim(3);
+        let output = readout(numerator, dot, scale.clone(), epsilon);
+        let last = |x: Tensor<4>| x.slice([0..batch, 0..heads, time - 1..time]);
+        let final_weights = last(weights).swap_dims(2, 3);
+        let final_carry = last(carry);
+        let memory = state.memory * final_carry.clone()
+            + key
+                .clone()
+                .swap_dims(2, 3)
+                .matmul(self.value * final_weights.clone());
+        let normalizer = state.normalizer * final_carry + key.swap_dims(2, 3).matmul(final_weights);
+        (
+            output,
+            MlstmState {
+                memory,
+                normalizer,
+                log_scale: last(scale),
+            },
+        )
+    }
+
     fn check(&self, epsilon: f64) -> [usize; 4] {
         let [batch, heads, time, dim] = self.query.dims();
         assert!(

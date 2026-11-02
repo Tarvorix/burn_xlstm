@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
+pub mod batch;
 pub mod cells;
 pub mod components;
 pub mod config;

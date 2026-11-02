@@ -73,6 +73,7 @@ fn all_architectures_learn_held_out_copy_without_convolution() {
         let config = XlstmConfig::new(16, blocks)
             .with_num_heads(2)
             .with_mlstm_inner_dim(Some(32))
+            .with_mlstm_chunk_size(Some(4))
             .with_feedforward_dim(Some(24))
             .with_conv_kernel(0);
         let mut model = XlstmLmConfig::new(4, config).init(&device).unwrap();

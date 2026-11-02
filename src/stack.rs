@@ -184,6 +184,8 @@ pub struct XlstmConfig {
     /// Memory heads in both block types.
     #[config(default = 4)]
     pub num_heads: usize,
+    /// Optional parallel mLSTM chunk length.
+    pub mlstm_chunk_size: Option<usize>,
     /// Expanded matrix-memory width; defaults to `ceil(2 * width / 64) * 64`.
     pub mlstm_inner_dim: Option<usize>,
     /// sLSTM feedforward width; defaults to `ceil(1.3 * width / 64) * 64`.
@@ -242,6 +244,7 @@ impl XlstmConfig {
                 }
                 BlockKind::Mlstm => {
                     let layer = MlstmConfig::new(self.embedding_dim)
+                        .with_chunk_size(self.mlstm_chunk_size)
                         .with_inner_dim(self.mlstm_inner_dim)
                         .with_num_heads(self.num_heads)
                         .with_qkv_block_size(self.qkv_block_size)
