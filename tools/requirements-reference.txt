@@ -1,0 +1,5 @@
+# Versions used to generate the committed CPU float32 NX-AI fixtures.
+torch==2.15.0
+numpy==2.5.4
+einops==0.8.2
+packaging==26.3
