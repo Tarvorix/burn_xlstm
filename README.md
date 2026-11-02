@@ -176,24 +176,44 @@ creating any tensors or model parameters. Other Burn backends can be
 enabled through a direct Burn dependency. `--no-default-features` builds the
 library without an execution backend.
 
-This is a portable tensor implementation of the original architecture. It does
-not include NX-AI's custom CUDA/Triton kernels, xLSTM-large/7B variants, a parallel
-chunkwise mLSTM kernel, packed/ragged sequences, padding masks, weight tying, or a
-general `PyTorch` checkpoint converter. Bias-free projections and GELU feedforwards
-match the selected reference configuration. GPU throughput and mixed-precision
-training have not been benchmarked or certified; float32 CPU is the numerical
-baseline. Parallel mLSTM uses O(time²) intermediate storage; use the stateful API
-for bounded recurrent memory during inference. sLSTM necessarily runs recurrently.
+This crate implements the defining components of the original 2024 xLSTM:
+stabilized exponential gating, scalar memory with recurrent mixing (sLSTM),
+matrix memory with covariance updates (mLSTM), and normalized residual blocks.
+It is an xLSTM implementation; the following limits describe execution efficiency,
+optional features, and compatibility with other model variants.
+
+| Feature | Current support and when it matters |
+| --- | --- |
+| Specialized CUDA/Triton kernels | Computation uses portable Burn tensor operations, including GPU execution through WGPU. NX-AI's specialized kernels are not ported; their absence affects performance, not the defining equations. |
+| Parallel chunkwise mLSTM | Full-sequence mLSTM is parallel with O(time²) intermediate storage. The stateful API accepts chunks but processes them recurrently. A parallel chunkwise kernel would improve the execution options for long-context training. |
+| xLSTM-large / pretrained 7B | NX-AI's later updated architecture and pretrained weights are not implemented. They are separate from the original architecture supported here. |
+| Packed/ragged sequences | Batches use rectangular tensors. Efficiently combining unequal-length sequences without padding needs additional support and sequence-boundary handling. |
+| Padding masks | There is no built-in padding mask. Use equal-length batches or handle padding-aware loss and recurrent state explicitly; padding is otherwise processed as input. |
+| Weight tying | Token embeddings and vocabulary output weights are independent. Sharing them is an optional parameter-saving feature. |
+| General PyTorch checkpoint import | Burn checkpoints are supported. Loading arbitrary NX-AI checkpoints would require a converter and matching architecture/configuration; the test fixture loader is not a general importer. |
+
+Bias-free projections and GELU feedforwards match the selected reference
+configuration. Float32 CPU and WGPU numerical parity are tested; GPU throughput
+and mixed-precision training have not been benchmarked or certified. Stateful
+inference retains bounded recurrent memory; sLSTM necessarily runs recurrently.
+
+NX-AI documents its [updated xLSTM Large architecture](https://github.com/NX-AI/xlstm#xlstm-7b-a-recurrent-llm-for-fast-and-efficient-inference)
+and [optimized mLSTM kernels](https://github.com/NX-AI/mlstm_kernels) separately.
 
 Two numerical edge cases are handled deliberately: empty sLSTM lanes initialize
 their scale independently, and readout avoids directly evaluating `exp(-m)` when
 `m` is very negative. One-dimensional scalar heads use the finite left endpoint
 of the reference's forget-bias schedule.
 
+## Publishing
+
+The initial crates.io release is prepared as `burn-xlstm` version `0.1.0`.
+See the [publishing guide](https://github.com/Tarvorix/burn_xlstm/blob/main/docs/PUBLISHING.md)
+for account setup, package verification, and the release commands.
+
 ## License
 
-Project code: [MIT](https://github.com/Tarvorix/burn_xlstm/blob/main/LICENSE). The xLSTM port is adapted from NX-AI's
-Apache-2.0-licensed implementation; its applicable notices and license are retained
-in [NOTICE](https://github.com/Tarvorix/burn_xlstm/blob/main/NOTICE) and
-[LICENSE-APACHE](https://github.com/Tarvorix/burn_xlstm/blob/main/LICENSE-APACHE). Distributed port code is
-subject to both sets of applicable terms (`MIT AND Apache-2.0`).
+Licensed under the [Apache License, Version 2.0](https://github.com/Tarvorix/burn_xlstm/blob/main/LICENSE),
+matching the [NX-AI/xlstm reference implementation](https://github.com/NX-AI/xlstm/blob/ab22eadbd245f293dd8dec38ed29963d73758a12/LICENSE).
+Upstream attribution and third-party notices are preserved in
+[NOTICE](https://github.com/Tarvorix/burn_xlstm/blob/main/NOTICE).
